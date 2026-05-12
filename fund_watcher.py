@@ -1,10 +1,11 @@
+import asyncio
 import json
 import logging
 import os
 import re
 from datetime import datetime
 
-import requests
+import httpx
 from lxml import etree
 from telegram import Update
 from telegram.ext import (
@@ -15,14 +16,16 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.ERROR)
 
-# ======================
-# 配置
-# ======================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 STATE_FILE = "fund_state.json"
 
 # {"users": {"<chat_id>": {"funds": {code: {name, limit, updated}}}}}
 state = {"users": {}}
+
+# cap concurrent outbound requests so eastmoney doesn't rate-limit us
+_http_sem = asyncio.Semaphore(5)
+# serialise file writes so concurrent saves don't interleave
+_state_lock = asyncio.Lock()
 
 
 # ======================
@@ -33,15 +36,19 @@ def load_state():
         return {"users": {}}
     with open(STATE_FILE, "r") as f:
         data = json.load(f)
-    # migrate old single-user format
     if "funds" in data and "users" not in data:
         return {"users": {"legacy": {"funds": data["funds"]}}}
     return data
 
 
-def save_state():
+def _write_state():
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, ensure_ascii=False)
+
+
+async def save_state():
+    async with _state_lock:
+        await asyncio.get_event_loop().run_in_executor(None, _write_state)
 
 
 def get_user_funds(chat_id: str) -> dict:
@@ -52,30 +59,33 @@ def get_user_funds(chat_id: str) -> dict:
 # ======================
 # HTTP
 # ======================
-def fetch_html(url):
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    resp.encoding = "utf-8"
-    return resp.text
+async def fetch_html(url: str) -> str:
+    async with _http_sem:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10.0,
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.text
 
 
 # ======================
-# 限购解析
+# 基金信息（名称 + 限购，单次请求）
 # ======================
-def parse_amount(text):
+def parse_amount(text: str) -> float | None:
     m = re.search(r"(\d+(?:\.\d+)?)\s*万\s*元", text)
     if m:
         return float(m.group(1)) * 10000
-
     m = re.search(r"(\d+(?:\.\d+)?)\s*元", text)
     if m:
         return float(m.group(1))
-
     return None
 
 
-def fetch_fund_info(code) -> tuple:
-    """Fetch name and purchase limit in a single HTTP request."""
-    html_text = fetch_html(f"https://fund.eastmoney.com/{code}.html")
+async def fetch_fund_info(code: str) -> tuple:
+    html_text = await fetch_html(f"https://fund.eastmoney.com/{code}.html")
     html = etree.HTML(html_text)
 
     name_nodes = html.xpath("//div[contains(@class,'fundDetail')]//h1/text()")
@@ -86,11 +96,7 @@ def fetch_fund_info(code) -> tuple:
         name = m.group(1).strip() if m else None
 
     nodes = html.xpath("//div[@class='buyWayWrap']//span")
-    texts = [
-        n.xpath("string(.)").strip()
-        for n in nodes
-        if n.xpath("string(.)").strip()
-    ]
+    texts = [n.xpath("string(.)").strip() for n in nodes if n.xpath("string(.)").strip()]
 
     limit = None
     for i, t in enumerate(texts):
@@ -113,16 +119,13 @@ def fetch_fund_info(code) -> tuple:
 def check_event(name, old, new):
     if old == 0 and new > 0:
         return f"🟢恢复申购 {name}\n{fmt_limit(new)}"
-
     if new == float("inf") and old != float("inf"):
         return f"🚀完全放开 {name}"
-
     if old is not None and new is not None:
         if new > old:
             return f"📈额度提升 {name}\n{fmt_limit(old)} → {fmt_limit(new)}"
         if new < old:
             return f"⚠️额度收紧 {name}\n{fmt_limit(old)} → {fmt_limit(new)}"
-
     return None
 
 
@@ -149,7 +152,7 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0]
     chat_id = str(update.effective_chat.id)
 
-    name, limit = fetch_fund_info(code)
+    name, limit = await fetch_fund_info(code)
 
     funds = get_user_funds(chat_id)
     funds[code] = {
@@ -157,21 +160,16 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "limit": limit,
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    save_state()
+    await save_state()
 
     icon = "🟢" if limit == float("inf") else "🔴" if not limit else "🟡"
-
     await update.message.reply_text(
-        f"""✅ 已加入监控
-
-📌 名称：{name}
-🆔 代码：{code}
-{icon} 当前额度：{fmt_limit(limit)}"""
+        f"✅ 已加入监控\n\n📌 名称：{name}\n🆔 代码：{code}\n{icon} 当前额度：{fmt_limit(limit)}"
     )
 
 
 # ======================
-# 命令：addall
+# 命令：addall（并发抓取）
 # ======================
 async def addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args)
@@ -183,21 +181,27 @@ async def addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = str(update.effective_chat.id)
     funds = get_user_funds(chat_id)
+
+    async def safe_fetch(code: str):
+        try:
+            return code, await fetch_fund_info(code)
+        except Exception as e:
+            logging.error(f"addall error {code}: {e}")
+            return code, None
+
+    results = await asyncio.gather(*[safe_fetch(c) for c in codes])
+
     added = []
-
-    for code in codes:
-        name, limit = fetch_fund_info(code)
-
-        funds[code] = {
-            "name": name,
-            "limit": limit,
-            "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for code, info in results:
+        if info is None:
+            added.append(f"✗ {code} 获取失败")
+            continue
+        name, limit = info
+        funds[code] = {"name": name, "limit": limit, "updated": now}
         added.append(f"✔ {name} 🆔: {code}")
 
-    save_state()
-
+    await save_state()
     await update.message.reply_text("📦 批量添加完成\n\n" + "\n".join(added))
 
 
@@ -216,14 +220,8 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if code in funds:
         name = funds[code]["name"]
         funds.pop(code)
-        save_state()
-
-        await update.message.reply_text(
-            f"""🗑 已移除监控
-
-📌 {name}
-🆔 {code}"""
-        )
+        await save_state()
+        await update.message.reply_text(f"🗑 已移除监控\n\n📌 {name}\n🆔 {code}")
     else:
         await update.message.reply_text("⚠️ 未找到该基金")
 
@@ -240,24 +238,15 @@ async def list_funds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = ["📊 基金监控（含更新时间）"]
-
     for code, v in funds.items():
-        icon = (
-            "🟢"
-            if v["limit"] == float("inf")
-            else "🔴"
-            if v["limit"] == 0
-            else "🟡"
-        )
-
-        updated = v.get("updated", "未知时间")
-
-        lines.append("")
-        lines.append(f"{icon} {v['name']}")
-        lines.append(f"   🆔 {code}")
-        lines.append(f"   💰 {fmt_limit(v['limit'])}")
-        lines.append(f"   ⏱ {updated}")
-
+        icon = "🟢" if v["limit"] == float("inf") else "🔴" if v["limit"] == 0 else "🟡"
+        lines.extend([
+            "",
+            f"{icon} {v['name']}",
+            f"   🆔 {code}",
+            f"   💰 {fmt_limit(v['limit'])}",
+            f"   ⏱ {v.get('updated', '未知时间')}",
+        ])
     await update.message.reply_text("\n".join(lines))
 
 
@@ -298,28 +287,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 监控任务（JobQueue）
 # ======================
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    # build code -> [chat_ids] so each unique fund is fetched exactly once
+    code_to_users: dict[str, list[str]] = {}
     for chat_id, user_data in list(state.get("users", {}).items()):
-        funds = user_data.get("funds", {})
-        for code, info in funds.items():
-            try:
-                _, new_limit = fetch_fund_info(code)
-                old_limit = info["limit"]
+        for code in user_data.get("funds", {}):
+            code_to_users.setdefault(code, []).append(chat_id)
 
-                if new_limit is None:
+    if not code_to_users:
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    async def check_one(code: str, chat_ids: list[str]):
+        try:
+            _, new_limit = await fetch_fund_info(code)
+            if new_limit is None:
+                return
+            for chat_id in chat_ids:
+                info = state["users"].get(chat_id, {}).get("funds", {}).get(code)
+                if info is None:
                     continue
-
+                old_limit = info["limit"]
                 if new_limit != old_limit:
                     msg = check_event(info["name"], old_limit, new_limit)
                     if msg:
                         await context.bot.send_message(chat_id=chat_id, text=msg)
-                    info["limit"] = new_limit
+                    state["users"][chat_id]["funds"][code]["limit"] = new_limit
+                state["users"][chat_id]["funds"][code]["updated"] = now
+        except Exception as e:
+            logging.error(f"monitor error {code}: {e}")
 
-                info["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            except Exception as e:
-                logging.error(f"monitor error {chat_id}/{code}: {e}")
-
-        save_state()
+    await asyncio.gather(*[check_one(c, u) for c, u in code_to_users.items()])
+    await save_state()
 
 
 # ======================
@@ -331,11 +330,11 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("addall", addall))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("list", list_funds))
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
     app.job_queue.run_repeating(monitor_job, interval=25000, first=5)
