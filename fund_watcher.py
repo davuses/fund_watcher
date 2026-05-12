@@ -290,6 +290,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+
 # ======================
 # 监控任务（JobQueue）
 # ======================
@@ -331,6 +335,7 @@ def main():
     app.add_handler(CommandHandler("addall", addall))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("list", list_funds))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
     app.job_queue.run_repeating(monitor_job, interval=25000, first=5)
