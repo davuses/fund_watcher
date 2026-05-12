@@ -11,3 +11,6 @@ wheels/
 
 # Environment variables
 .env
+
+# Runtime state
+fund_state.json
