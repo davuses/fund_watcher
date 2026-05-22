@@ -53,3 +53,7 @@ State is persisted to `fund_state.json` in the working directory.
 | 🟡 | Open with a purchase cap |
 | 🔴 | Suspended |
 | ❓ | Status unknown |
+
+## Demo
+
+![Demo](https://github.com/user-attachments/assets/43830699-6d6e-4529-ae34-52a82acaa19d)
