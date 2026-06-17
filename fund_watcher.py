@@ -144,30 +144,6 @@ def fmt_limit(v):
 # ======================
 # 命令：add
 # ======================
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("用法：/add 018147")
-        return
-
-    code = context.args[0]
-    chat_id = str(update.effective_chat.id)
-
-    name, limit = await fetch_fund_info(code)
-
-    funds = get_user_funds(chat_id)
-    funds[code] = {
-        "name": name,
-        "limit": limit,
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    await save_state()
-
-    icon = "🟢" if limit == float("inf") else "🔴" if not limit else "🟡"
-    await update.message.reply_text(
-        f"✅ 已加入监控\n\n📌 名称：{name}\n🆔 代码：{code}\n{icon} 当前额度：{fmt_limit(limit)}"
-    )
-
-
 # ======================
 # 命令：addall（并发抓取）
 # ======================
@@ -199,31 +175,37 @@ async def addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         name, limit = info
         funds[code] = {"name": name, "limit": limit, "updated": now}
-        added.append(f"✔ {name} 🆔: {code}")
+        icon = "🟢" if limit == float("inf") else "🔴" if not limit else "🟡"
+        added.append(f"✔ {name} 🆔: {code} {icon} 额度：{fmt_limit(limit)}")
 
     await save_state()
     await update.message.reply_text("📦 批量添加完成\n\n" + "\n".join(added))
 
 
 # ======================
-# 命令：remove
+# 命令：removeall
 # ======================
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("用法：/remove 018147")
+async def removeall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = " ".join(context.args)
+    codes = list(set(re.findall(r"\d{6}", raw)))
+
+    if not codes:
+        await update.message.reply_text("未识别到基金代码")
         return
 
-    code = context.args[0]
     chat_id = str(update.effective_chat.id)
     funds = get_user_funds(chat_id)
 
-    if code in funds:
-        name = funds[code]["name"]
-        funds.pop(code)
-        await save_state()
-        await update.message.reply_text(f"🗑 已移除监控\n\n📌 {name}\n🆔 {code}")
-    else:
-        await update.message.reply_text("⚠️ 未找到该基金")
+    removed = []
+    for code in codes:
+        if code in funds:
+            name = funds.pop(code)["name"]
+            removed.append(f"🗑 {name} 🆔: {code}")
+        else:
+            removed.append(f"⚠️ {code} 未找到")
+
+    await save_state()
+    await update.message.reply_text("📦 批量移除完成\n\n" + "\n".join(removed))
 
 
 # ======================
@@ -255,17 +237,15 @@ HELP_TEXT = """
 
 可用命令：
 
-/add 代码
-  添加单只基金监控
-  例：/add 018147
-
 /addall 代码列表
-  批量添加基金
+  添加基金监控（支持单只或批量）
+  例：/addall 018147
   例：/addall 018147, 019455
 
-/remove 代码
-  移除基金监控
-  例：/remove 018147
+/removeall 代码列表
+  移除基金监控（支持单只或批量）
+  例：/removeall 018147
+  例：/removeall 018147, 019455
 
 /list
   查看当前监控列表
@@ -331,9 +311,8 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("addall", addall))
-    app.add_handler(CommandHandler("remove", remove))
+    app.add_handler(CommandHandler("removeall", removeall))
     app.add_handler(CommandHandler("list", list_funds))
     app.add_handler(CommandHandler("help", help_cmd))
 
